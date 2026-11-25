@@ -1,0 +1,37 @@
+{
+  "name": "koishi-plugin-weidian-monitor",
+  "version": "1.0.0",
+  "description": "微店 / 摩点 / OWHAT / 桃叭 众筹监控与订单播报插件（Koishi v4）",
+  "homepage": "https://github.com/sxedward/koishi-plugin-weidian-monitor#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sxedward/koishi-plugin-weidian-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/sxedward/koishi-plugin-weidian-monitor/issues"
+  },
+  "main": "src/index.js",
+  "keywords": [
+    "koishi",
+    "koishi-plugin",
+    "weidian",
+    "modian",
+    "owhat",
+    "taoba",
+    "crowdfunding"
+  ],
+  "koishi": {
+    "service": {
+      "required": [
+        "http"
+      ],
+      "optional": [
+        "puppeteer"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.0"
+  },
+  "license": "MIT"
+}
