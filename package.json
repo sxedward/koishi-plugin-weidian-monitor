@@ -1,6 +1,6 @@
 {
   "name": "@sxedward/koishi-plugin-weidian-monitor",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "微店 / 摩点 / OWHAT / 桃叭 众筹监控、订单播报与微店订单自动发货插件（Koishi v4）",
   "homepage": "https://github.com/sxedward/sxedward-koishi-plugin-weidian-monitor#readme",
   "repository": {

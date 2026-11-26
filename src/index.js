@@ -19,6 +19,7 @@ const PLATFORM_LINK = {
 
 const DEFAULT_TEMPLATE = '【{project}】新集资 +{diff} 元，当前 {amount} 元，{supporters} 人参与\n{link}'
 const DEFAULT_DELIVERY_TEMPLATE = '【自动发货】订单 {orderId} 已发货（{mode}）\n商品：{items}\n金额：{amount} 元\n卡密：{codes}'
+const DEFAULT_PAID_TEMPLATE = '【新订单】订单 {orderId} 已付款\n商品：{items}\n金额：{amount} 元\n时间：{time}'
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36'
 
@@ -26,6 +27,10 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 const WD_ORDER_LIST_API = 'https://thor.weidian.com/tradeview/seller.getOrderListForPC/1.0'
 const WD_ORDER_DELIVER_API = 'https://thor.weidian.com/tradeview/seller.deliverOrder/1.0'
 const WD_SUB_ACCOUNT_LOGIN_URL = 'https://d.weidian.com/weidian-pc/login/#/subAccount'
+
+// 短信登录的两步状态需要跨插件配置热重载保留，因此放在模块作用域。
+let consolePendingSms = null
+let consoleLoginSignature = ''
 
 /* ---------------------------------- 工具 ---------------------------------- */
 
@@ -315,6 +320,18 @@ const Config = Schema.object({
   loginTimeout: Schema.number().min(30).max(600).default(180).description('等待扫码 / 短信验证码 / 登录完成的超时（秒）'),
   cookieDomains: Schema.array(Schema.string()).default(['weidian.com']).description('提取 Cookie 时保留的域名关键字'),
   autoUseLoginCookie: Schema.boolean().default(true).description('微店项目未单独配置 cookie 时，自动使用登录得到的 Cookie'),
+  login: Schema.object({
+    mode: Schema.union([
+      Schema.const('none'), Schema.const('cookie'), Schema.const('password'),
+      Schema.const('sms'), Schema.const('subaccount'),
+    ]).default('none').description('登录方式；只在 Koishi 插件配置页生效，QQ/群聊已移除登录命令'),
+    cookie: Schema.string().role('secret').default('').description('mode=cookie：直接粘贴从浏览器复制的 Cookie'),
+    phone: Schema.string().default('').description('绑定手机号（密码 / 短信 / 子账号登录）'),
+    password: Schema.string().role('secret').default('').description('登录密码（密码 / 子账号登录）'),
+    subAccount: Schema.string().default('').description('子账号登录名（mode=subaccount）'),
+    requestSmsCode: Schema.boolean().default(false).description('mode=sms：设为 true 并保存以发送验证码；收到后改回 false 并填 smsCode'),
+    smsCode: Schema.string().default('').description('mode=sms：收到的短信验证码，填写并保存后完成登录'),
+  }).default({}).description('微店登录配置（仅插件页面，不通过 QQ 命令）'),
   phoneSelector: Schema.string().default('.user-telephone input[placeholder="手机号"], input[name="telephone"], input[placeholder="手机号"]')
     .description('手机号输入框选择器（密码 / 短信登录）'),
   passwordSelector: Schema.string().default('input[type="password"][placeholder="输入登录密码"], input[name="login-pwd"], input[type="password"]')
@@ -341,8 +358,10 @@ const Config = Schema.object({
     skuIds: Schema.array(Schema.string()).default([]).description('仅发货这些 SKU ID，留空表示不限'),
     itemTitles: Schema.array(Schema.string()).default([]).description('商品标题包含任一关键词才发货，留空表示不限'),
     minAmount: Schema.number().min(0).default(0).description('订单金额下限，0 表示不限'),
-    channels: Schema.array(Schema.string()).default([]).description('发货结果播报频道'),
-    template: Schema.string().default(DEFAULT_DELIVERY_TEMPLATE).description('发货播报模板'),
+    channels: Schema.array(Schema.string()).default([]).description('播报频道（付款播报使用，不再播报发货）'),
+    template: Schema.string().default(DEFAULT_DELIVERY_TEMPLATE).description('已废弃：发货播报模板，现仅保留兼容，不再发送'),
+    noticeOnPaid: Schema.boolean().default(true).description('新付款订单播报开关（发货过程保持静默）'),
+    paidTemplate: Schema.string().default(DEFAULT_PAID_TEMPLATE).description('付款播报模板，支持 {orderId}/{items}/{amount}/{buyer}/{time}'),
     dryRun: Schema.boolean().default(false).description('演练模式：只记录不真正发货'),
     maxPerRun: Schema.number().min(1).max(100).default(20).description('每轮最多处理的订单数'),
     retryAttempts: Schema.number().min(0).max(5).default(2).description('单笔发货失败重试次数'),
@@ -350,7 +369,7 @@ const Config = Schema.object({
 })
 
 exports.name = 'weidian-monitor'
-exports.usage = '微店 / 摩点 / OWHAT / 桃叭 众筹监控播报；支持用子账号 Cookie 自动拉取微店待发货订单并发货。管理员可通过多种方式登录并自动提取 Cookie。'
+exports.usage = '微店 / 摩点 / OWHAT / 桃叭 众筹监控播报；登录仅在 Koishi 插件配置页进行；微店订单按付款播报，发货保持静默。'
 exports.Config = Config
 // 浏览器服务为可选依赖：未安装 puppeteer 插件时监控照常工作，仅扫码登录不可用。
 exports.inject = { optional: ['puppeteer'] }
@@ -360,7 +379,7 @@ exports.apply = (ctx, config) => {
   const statePath = path.join(ctx.baseDir || process.cwd(), 'weidian-monitor-state.json')
   const defaultState = {
     snapshots: {}, enabled: {}, globalThanks: '', login: null,
-    delivery: { enabled: null, processed: {}, usedCodes: [], lastRun: 0, lastSummary: '' },
+    delivery: { enabled: null, processed: {}, paidSeen: {}, usedCodes: [], lastRun: 0, lastSummary: '' },
   }
   const state = { ...defaultState, delivery: { ...defaultState.delivery } }
   const timers = []
@@ -386,6 +405,7 @@ exports.apply = (ctx, config) => {
           ...defaultState.delivery,
           ...(raw.delivery || {}),
           processed: raw.delivery?.processed || {},
+          paidSeen: raw.delivery?.paidSeen || {},
           usedCodes: raw.delivery?.usedCodes || [],
         }
       }
@@ -502,6 +522,20 @@ exports.apply = (ctx, config) => {
     )
   }
 
+  function renderPaid(template, order) {
+    const variables = {
+      orderId: String(order?.orderId ?? order?.order_id ?? ''),
+      items: orderItemText(order),
+      amount: money(orderAmount(order)),
+      buyer: String(order?.buyerInfo?.name || order?.buyerName || '买家'),
+      time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+    }
+    return Object.entries(variables).reduce(
+      (text, [key, value]) => text.split(`{${key}}`).join(value),
+      template,
+    )
+  }
+
   async function deliverOne(order, cookie) {
     const delivery = deliveryConfig()
     const mode = delivery.mode || 'no-logistics'
@@ -551,9 +585,9 @@ exports.apply = (ctx, config) => {
   async function runAutoDelivery(force = false) {
     if (deliveryInProgress) return { summary: '已有自动发货任务正在执行，请稍后再试。', lines: [] }
     const delivery = deliveryConfig()
-    if (!force && !deliveryEnabled()) return { summary: '自动发货未启用。可发送「微店发货开启」开启定时发货；明确执行一次请用「微店发货」。', lines: [] }
     const cookie = deliveryCookie()
-    if (!cookie) return { summary: '没有可用的微店 Cookie，请先登录或设置 Cookie。', lines: [] }
+    if (!cookie) return { summary: '没有可用的微店 Cookie，请在插件配置页完成登录。', lines: [] }
+    const doDeliver = force || deliveryEnabled()
 
     deliveryInProgress = true
     const lines = []
@@ -561,6 +595,7 @@ exports.apply = (ctx, config) => {
     let success = 0
     let failed = 0
     let skipped = 0
+    let paid = 0
     try {
       const orders = await fetchPaidOrders(cookie)
       total = orders.length
@@ -571,6 +606,17 @@ exports.apply = (ctx, config) => {
           skipped += 1
           continue
         }
+        // 只播报新付款订单，发货过程保持静默
+        if (delivery.noticeOnPaid !== false && !state.delivery.paidSeen[orderId]) {
+          const channels = delivery.channels || []
+          if (channels.length) {
+            await broadcast(channels, renderPaid(delivery.paidTemplate || DEFAULT_PAID_TEMPLATE, order))
+            paid += 1
+          }
+          state.delivery.paidSeen[orderId] = { at: Date.now(), amount: orderAmount(order) }
+          await saveState()
+        }
+        if (!doDeliver) continue
         if (state.delivery.processed[orderId]) {
           skipped += 1
           continue
@@ -594,11 +640,6 @@ exports.apply = (ctx, config) => {
               if (!state.delivery.usedCodes.includes(code)) state.delivery.usedCodes.push(code)
             }
             success += 1
-            if (delivery.channels?.length) {
-              await broadcast(delivery.channels, renderDelivery(
-                delivery.template || DEFAULT_DELIVERY_TEMPLATE, order, result.codes, delivery.mode || 'no-logistics',
-              ))
-            }
             lines.push(`✅ ${orderId} ${result.message}`)
           } else if (result.ok && result.dryRun) {
             skipped += 1
@@ -614,9 +655,9 @@ exports.apply = (ctx, config) => {
         await saveState()
       }
       state.delivery.lastRun = Date.now()
-      state.delivery.lastSummary = `待发货 ${total}，成功 ${success}，失败 ${failed}，跳过 ${skipped}`
+      state.delivery.lastSummary = `付款播报 ${paid}，待发货 ${total}，发货成功 ${success}，失败 ${failed}，跳过 ${skipped}${doDeliver ? '' : '（发货未启用）'}`
       await saveState()
-      return { summary: state.delivery.lastSummary, lines, total, success, failed, skipped }
+      return { summary: state.delivery.lastSummary, lines, total, success, failed, skipped, paid }
     } catch (error) {
       logger.warn(`自动发货失败：${error.message}`)
       return { summary: `自动发货失败：${error.message}`, lines, total, success, failed, skipped }
@@ -1011,16 +1052,24 @@ exports.apply = (ctx, config) => {
   }
 
   async function sendScreenshot(page, session, text) {
-    try {
-      const image = await page.screenshot({ type: 'png' })
-      await session.send(h.image(image, 'image/png'))
-    } catch (error) {
-      logger.warn(`发送验证截图失败：${error.message}`)
+    const image = await page.screenshot({ type: 'png' }).catch((error) => {
+      logger.warn(`截取验证页面失败：${error.message}`)
+      return null
+    })
+    if (session && typeof session.send === 'function') {
+      if (image) {
+        await session.send(h.image(image, 'image/png')).catch(() => {})
+      }
+      await session.send(text).catch(() => {})
+      return
     }
-    try {
-      await session.send(text)
-    } catch {
-      // 会话可能已失效
+    // 配置页登录没有 QQ 会话：截图落到工作目录，日志给出路径
+    if (image) {
+      const file = path.join(ctx.baseDir || process.cwd(), 'weidian-login-captcha.png')
+      await fs.writeFile(file, image).catch((error) => logger.warn(`保存验证截图失败：${error.message}`))
+      logger.warn(`${text} 验证截图已保存到 ${file}`)
+    } else {
+      logger.warn(text)
     }
   }
 
@@ -1228,28 +1277,108 @@ exports.apply = (ctx, config) => {
     return '已取消短信验证码登录。'
   }
 
+  // 所有登录只由插件配置页驱动，QQ / 群聊不再提供任何登录命令。
+  async function runConfiguredLogin() {
+    const loginConfig = config.login || {}
+    const signature = JSON.stringify(loginConfig)
+    if (consoleLoginSignature === signature) return
+    consoleLoginSignature = signature
+    const mode = loginConfig.mode || 'none'
+    if (mode === 'none') return
+
+    if (mode === 'cookie') {
+      const cookie = String(loginConfig.cookie || '').trim()
+      if (!cookie) {
+        logger.warn('登录配置 mode=cookie，但未填写 login.cookie。')
+        return
+      }
+      state.login = { cookie, savedAt: Date.now(), source: 'config' }
+      await saveState()
+      logger.info(`已从插件配置页载入 Cookie：${maskCookie(cookie)}`)
+      return
+    }
+
+    const missing = requirePuppeteer()
+    if (missing) {
+      logger.warn(missing)
+      return
+    }
+
+    const consoleSession = {
+      userId: '__koishi_console__',
+      send: async (message) => {
+        if (typeof message === 'string') logger.info(message)
+      },
+    }
+
+    if (mode === 'password') {
+      if (!loginConfig.phone || !loginConfig.password) {
+        logger.warn('密码登录需要填写 login.phone 与 login.password。')
+        return
+      }
+      logger.info(await loginWithPassword(null, loginConfig.phone, loginConfig.password))
+      return
+    }
+
+    if (mode === 'subaccount') {
+      if (!loginConfig.phone || !loginConfig.subAccount || !loginConfig.password) {
+        logger.warn('子账号登录需要填写 login.phone、login.subAccount 与 login.password。')
+        return
+      }
+      logger.info(await loginWithSubAccount(null, loginConfig.phone, loginConfig.subAccount, loginConfig.password))
+      return
+    }
+
+    if (mode === 'sms') {
+      if (consolePendingSms) pendingLogins.set(consoleSession.userId, consolePendingSms)
+      if (loginConfig.requestSmsCode && !loginConfig.smsCode) {
+        if (!loginConfig.phone) {
+          logger.warn('短信登录需要填写 login.phone。')
+          return
+        }
+        const message = await requestSmsCode(consoleSession, loginConfig.phone)
+        consolePendingSms = pendingLogins.get(consoleSession.userId) || null
+        logger.info(message)
+        logger.info('收到验证码后，请把 requestSmsCode 改为 false、填入 login.smsCode 并保存配置。')
+        return
+      }
+      if (loginConfig.smsCode) {
+        if (!pendingLogins.has(consoleSession.userId)) {
+          logger.warn('没有待验证的短信会话。请先把 login.requestSmsCode 设为 true 并保存以发送验证码。')
+          return
+        }
+        logger.info(await submitSmsCode(consoleSession, loginConfig.smsCode))
+        consolePendingSms = null
+      }
+    }
+  }
+
   ctx.on('ready', async () => {
     if (started) return
     started = true
     await loadState()
+    // 登录只在插件配置页进行；配置变更后插件重载会再次执行。
+    await runConfiguredLogin()
     // 先静默抓取一次建立基线，避免重启后重复播报旧数据
     await Promise.all(config.projects.map((_, index) => poll(index, true)))
     config.projects.forEach((project, index) => {
       timers.push(ctx.setInterval(() => poll(index), Math.max(10, project.interval) * 1000))
     })
-    // 定时发货轮询常驻，每次执行前读取运行时开关，确保「微店发货开启/关闭」立即生效
+    // 订单轮询常驻：付款播报始终进行，发货按运行时开关决定是否执行
     timers.push(ctx.setInterval(() => {
-      if (!deliveryEnabled() || deliveryInProgress) return
-      runAutoDelivery().catch((error) => logger.warn(`自动发货异常：${error.message}`))
+      if (deliveryInProgress) return
+      runAutoDelivery().catch((error) => logger.warn(`订单轮询异常：${error.message}`))
     }, Math.max(10, Number(deliveryConfig().interval) || 30) * 1000))
-    logger.info(`微店订单自动发货轮询已就绪，当前状态：${deliveryEnabled() ? '开启' : '关闭'}（可用「微店发货开启/关闭」切换）`)
+    logger.info(`微店订单轮询已就绪，付款播报：${deliveryConfig().noticeOnPaid === false ? '关闭' : '开启'}，自动发货：${deliveryEnabled() ? '开启' : '关闭'}`)
     logger.info(`微店监控已启动，共 ${config.projects.length} 个项目`)
   })
 
   ctx.on('dispose', () => {
     for (const timer of timers) clearInterval(timer)
     timers.length = 0
-    for (const userId of Array.from(pendingLogins.keys())) clearPendingLogin(userId)
+    for (const userId of Array.from(pendingLogins.keys())) {
+      if (userId !== '__koishi_console__') clearPendingLogin(userId)
+    }
   })
 
   ctx.command('微店状态', '查看当前监控的项目与集资数据')
@@ -1302,63 +1431,8 @@ exports.apply = (ctx, config) => {
       return state.globalThanks ? `播报模板已设为：${state.globalThanks}` : '已恢复各项目自己的播报模板。'
     })
 
-  ctx.command('微店登录', '扫码登录微店并自动提取 Cookie（管理员，建议私聊）')
-    .action(async ({ session }) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return login(session)
-    })
-
-  ctx.command('微店密码登录 <account:string> <password:string>', '使用手机号与密码登录微店（管理员，建议私聊）')
-    .action(async ({ session }, account, password) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return loginWithPassword(session, account, password)
-    })
-
-  ctx.command('微店短信登录 <phone:string>', '获取短信验证码登录微店（管理员，建议私聊）')
-    .action(async ({ session }, phone) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return requestSmsCode(session, phone)
-    })
-
-  ctx.command('微店验证码 <code:string>', '提交短信验证码，完成微店登录（管理员）')
-    .action(async ({ session }, code) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return submitSmsCode(session, code)
-    })
-
-  ctx.command('微店登录取消', '取消进行中的短信验证码登录（管理员）')
-    .action(async ({ session }) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return cancelLogin(session)
-    })
-
-  ctx.command('微店Cookie [cookie:text]', '查看、设置或清除保存的 Cookie（管理员）')
-    .alias('微店登录状态')
-    .action(async ({ session }, cookie) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      if (cookie === undefined || !cookie.trim()) {
-        if (!state.login) return '当前没有保存的 Cookie。可发送「微店登录」「微店密码登录」「微店短信登录」，或用「微店Cookie <内容>」手动设置。'
-        const sourceLabel = { qr: '扫码登录', password: '密码登录', sms: '短信登录', subaccount: '子账号登录', manual: '手动设置' }
-        return `已保存 Cookie：${maskCookie(state.login.cookie)}\n`
-          + `来源：${sourceLabel[state.login.source] || '手动设置'}\n`
-          + `保存时间：${new Date(state.login.savedAt).toLocaleString('zh-CN')}`
-      }
-      const value = cookie.trim()
-      if (value === 'clear' || value === '清除') {
-        state.login = null
-        await saveState()
-        return '已清除保存的 Cookie。'
-      }
-      state.login = { cookie: value, savedAt: Date.now(), source: 'manual' }
-      await saveState()
-      return `Cookie 已保存：${maskCookie(value)}`
-    })
-
-  ctx.command('微店子账号登录 <phone:string> <account:string> <password:string>', '用微店子账号登录并自动提取 Cookie（管理员，强烈建议私聊）')
-    .action(async ({ session }, phone, account, password) => {
-      if (!isAdmin(session)) return '您没有权限执行此命令。'
-      return loginWithSubAccount(session, phone, account, password)
-    })
+  // 登录命令已全部移除：请在 Koishi 插件配置页的 login 段填写账号密码 / 短信验证码 / Cookie。
+  // 二维码、截图等交互不再发送到 QQ，验证截图会保存到工作目录并写入日志。
 
   ctx.command('微店发货', '手动执行一次自动发货，不受定时开关影响（管理员）')
     .action(async ({ session }) => {
@@ -1420,18 +1494,13 @@ exports.apply = (ctx, config) => {
       '  微店测试 —— 立即刷新全部项目（管理员）',
       '  微店开启/关闭 <序号> —— 开关监控（管理员）',
       '  微店感谢 <模板> —— 设置播报模板（管理员）',
-      '  微店登录 —— 扫码登录并自动提取 Cookie（管理员）',
-      '  微店密码登录 <账号> <密码> —— 手机号 + 密码登录（管理员，建议私聊）',
-      '  微店短信登录 <手机号> —— 发送短信验证码（管理员，建议私聊）',
-      '  微店验证码 <验证码> —— 完成短信登录（管理员）',
-      '  微店登录取消 —— 取消待验证的短信登录（管理员）',
-      '  微店子账号登录 <手机号> <子账号> <密码> —— 用权限子账号登录（管理员，建议私聊）',
-      '  微店Cookie [内容] —— 查看/设置/清除 Cookie（管理员）',
-      '  微店发货 —— 手动执行一次发货，即使定时发货关闭也可用（管理员）',
+      '  微店发货 —— 手动执行一次发货（管理员，发货过程不再播报）',
       '  微店发货开启/关闭 —— 运行时开关定时发货，状态会保存（管理员）',
       '  微店发货状态 —— 查看发货进度与卡密用量（管理员）',
       '  微店发货重置 —— 清空发货与卡密记录（管理员）',
+      '登录说明：所有登录仅在 Koishi 插件配置页 login 段进行，QQ/群聊已移除登录命令。',
+      '播报说明：仅播报新付款订单，不播报发货结果。',
       '监控模板变量：{project} {name} {amount} {diff} {change} {supporters} {link}',
-      '发货模板变量：{orderId} {items} {amount} {codes} {mode} {buyer} {time}',
+      '付款模板变量：{orderId} {items} {amount} {buyer} {time}',
     ].join('\n'))
 }

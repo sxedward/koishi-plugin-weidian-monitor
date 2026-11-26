@@ -1,5 +1,12 @@
 # 更新日志
 
+## 1.4.0 (2026-11-26)
+
+- 登录改为**仅在 Koishi 插件配置页进行**：移除 QQ / 群聊中的 `微店登录`、`微店密码登录`、`微店短信登录`、`微店验证码`、`微店登录取消`、`微店子账号登录`、`微店Cookie` 命令。
+- 新增 `login` 配置段，支持 `cookie`、`password`、`subaccount`、`sms` 四种方式；短信登录改为配置页两步完成，验证截图保存到工作目录并写入日志。
+- 订单播报改为**只播报新付款订单，不播报发货结果**：新增 `autoDelivery.noticeOnPaid` 与 `autoDelivery.paidTemplate`，发货过程保持静默；付款与发货均按订单号去重。
+- 更新 README 与新人入门指南，说明新的登录与播报规则。
+
 ## 1.3.0 (2026-11-26)
 
 - npm 包迁移至作用域包 `@sxedward/koishi-plugin-weidian-monitor`，旧包 `koishi-plugin-weidian-monitor` 已标记为弃用。
