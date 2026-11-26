@@ -1,14 +1,20 @@
 {
-  "name": "koishi-plugin-weidian-monitor",
-  "version": "1.2.0",
+  "name": "@sxedward/koishi-plugin-weidian-monitor",
+  "version": "1.3.0",
   "description": "微店 / 摩点 / OWHAT / 桃叭 众筹监控、订单播报与微店订单自动发货插件（Koishi v4）",
-  "homepage": "https://github.com/sxedward/koishi-plugin-weidian-monitor#readme",
+  "homepage": "https://github.com/sxedward/sxedward-koishi-plugin-weidian-monitor#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/sxedward/koishi-plugin-weidian-monitor.git"
+    "url": "git+https://github.com/sxedward/sxedward-koishi-plugin-weidian-monitor.git"
   },
   "bugs": {
-    "url": "https://github.com/sxedward/koishi-plugin-weidian-monitor/issues"
+    "url": "https://github.com/sxedward/sxedward-koishi-plugin-weidian-monitor/issues"
+  },
+  "author": {
+    "name": "sxedward",
+    "email": "sxedward@163.com",
+    "qq": "827679511",
+    "url": "https://github.com/sxedward"
   },
   "main": "src/index.js",
   "keywords": [

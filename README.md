@@ -1,4 +1,4 @@
-# koishi-plugin-weidian-monitor
+# @sxedward/koishi-plugin-weidian-monitor
 
 微店 / 摩点 / OWHAT / 桃叭 众筹监控、订单播报与**微店订单自动发货**插件，适用于 **Koishi v4**。
 
@@ -9,8 +9,10 @@
 将本目录放入 Koishi 工作区的 `plugins/` 下，或执行：
 
 ```bash
-npm install koishi-plugin-weidian-monitor
+npm install @sxedward/koishi-plugin-weidian-monitor
 ```
+
+旧包名 `koishi-plugin-weidian-monitor` 已弃用，请改用上面的新作用域包；Koishi 控制台可执行 `koishi add sxedward/koishi-plugin-weidian-monitor` 安装。
 
 无需编译（CommonJS）。在 `koishi.yml` 中启用：
 
@@ -205,3 +207,11 @@ plugins:
 平台的接口和字段可能调整。若抓取失败，可给项目配置 `api` 指向自定义 HTTP 接口（返回 JSON 且包含 `amount`/`backer_money`/`donation` 与 `backer_count`/`people` 等字段即可）。
 
 运行状态保存在 Koishi 工作目录下的 `weidian-monitor-state.json`，重启后不会重复播报已有数据。`ctx.http` 为 Koishi 内置服务，可通过全局代理配置统一设置网络代理。
+
+## 联系作者
+
+- 邮箱：`sxedward@163.com`
+- QQ：`827679511`
+- GitHub：<https://github.com/sxedward>
+- 问题反馈：<https://github.com/sxedward/sxedward-koishi-plugin-weidian-monitor/issues>
+- 更新日志：[CHANGELOG.md](./CHANGELOG.md)
