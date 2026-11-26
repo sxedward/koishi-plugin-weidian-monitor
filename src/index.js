@@ -326,9 +326,9 @@ const Config = Schema.object({
   subAccountSelector: Schema.string().default('input[placeholder="子账号登录名"], input[name="subaccountId"]')
     .description('子账号登录名输入框选择器'),
   autoDelivery: Schema.object({
-    enabled: Schema.boolean().default(false).description('是否启用订单自动发货'),
+    enabled: Schema.boolean().default(false).description('订单自动发货默认开关；默认关闭，可用「微店发货开启/关闭」在运行时覆盖'),
     interval: Schema.number().min(10).default(30).description('轮询待发货订单的间隔（秒）'),
-    cookie: Schema.string().role('secret').default('').description('发货专用 Cookie；留空则用「微店Cookie」保存的 Cookie（建议用权限全开的子账号登录）'),
+    cookie: Schema.string().role('secret').default('').description('发货专用 Cookie；留空则与播报共用一次登录保存的 Cookie（建议用权限全开的子账号登录）'),
     listType: Schema.number().min(0).max(3).default(0).description('订单列表类型，0=普通订单'),
     mode: Schema.union([
       Schema.const('no-logistics'), Schema.const('ecode'), Schema.const('express'),
@@ -548,10 +548,10 @@ exports.apply = (ctx, config) => {
     return { ok: false, codes, message: lastError?.message || '发货失败' }
   }
 
-  async function runAutoDelivery() {
+  async function runAutoDelivery(force = false) {
     if (deliveryInProgress) return { summary: '已有自动发货任务正在执行，请稍后再试。', lines: [] }
     const delivery = deliveryConfig()
-    if (!deliveryEnabled()) return { summary: '自动发货未启用。可发送「微店发货开启」临时开启。', lines: [] }
+    if (!force && !deliveryEnabled()) return { summary: '自动发货未启用。可发送「微店发货开启」开启定时发货；明确执行一次请用「微店发货」。', lines: [] }
     const cookie = deliveryCookie()
     if (!cookie) return { summary: '没有可用的微店 Cookie，请先登录或设置 Cookie。', lines: [] }
 
@@ -1237,12 +1237,12 @@ exports.apply = (ctx, config) => {
     config.projects.forEach((project, index) => {
       timers.push(ctx.setInterval(() => poll(index), Math.max(10, project.interval) * 1000))
     })
-    if (deliveryEnabled()) {
-      timers.push(ctx.setInterval(() => {
-        if (!deliveryInProgress) runAutoDelivery().catch((error) => logger.warn(`自动发货异常：${error.message}`))
-      }, Math.max(10, Number(deliveryConfig().interval) || 30) * 1000))
-      logger.info('微店订单自动发货已启动')
-    }
+    // 定时发货轮询常驻，每次执行前读取运行时开关，确保「微店发货开启/关闭」立即生效
+    timers.push(ctx.setInterval(() => {
+      if (!deliveryEnabled() || deliveryInProgress) return
+      runAutoDelivery().catch((error) => logger.warn(`自动发货异常：${error.message}`))
+    }, Math.max(10, Number(deliveryConfig().interval) || 30) * 1000))
+    logger.info(`微店订单自动发货轮询已就绪，当前状态：${deliveryEnabled() ? '开启' : '关闭'}（可用「微店发货开启/关闭」切换）`)
     logger.info(`微店监控已启动，共 ${config.projects.length} 个项目`)
   })
 
@@ -1360,27 +1360,27 @@ exports.apply = (ctx, config) => {
       return loginWithSubAccount(session, phone, account, password)
     })
 
-  ctx.command('微店发货', '立即执行一次订单自动发货（管理员）')
+  ctx.command('微店发货', '手动执行一次自动发货，不受定时开关影响（管理员）')
     .action(async ({ session }) => {
       if (!isAdmin(session)) return '您没有权限执行此命令。'
-      const result = await runAutoDelivery()
+      const result = await runAutoDelivery(true)
       return [result.summary, ...result.lines].join('\n')
     })
 
-  ctx.command('微店发货开启', '临时开启自动发货（管理员）')
+  ctx.command('微店发货开启', '开启定时自动发货，状态保存到本地（管理员）')
     .action(async ({ session }) => {
       if (!isAdmin(session)) return '您没有权限执行此命令。'
       state.delivery.enabled = true
       await saveState()
-      return '自动发货已开启。'
+      return '定时自动发货已开启。'
     })
 
-  ctx.command('微店发货关闭', '临时关闭自动发货（管理员）')
+  ctx.command('微店发货关闭', '关闭定时自动发货，不影响手动执行一次（管理员）')
     .action(async ({ session }) => {
       if (!isAdmin(session)) return '您没有权限执行此命令。'
       state.delivery.enabled = false
       await saveState()
-      return '自动发货已关闭。'
+      return '定时自动发货已关闭；需要单次发货可发送「微店发货」。'
     })
 
   ctx.command('微店发货状态', '查看自动发货状态（管理员）')
@@ -1427,8 +1427,8 @@ exports.apply = (ctx, config) => {
       '  微店登录取消 —— 取消待验证的短信登录（管理员）',
       '  微店子账号登录 <手机号> <子账号> <密码> —— 用权限子账号登录（管理员，建议私聊）',
       '  微店Cookie [内容] —— 查看/设置/清除 Cookie（管理员）',
-      '  微店发货 —— 立即执行一次自动发货（管理员）',
-      '  微店发货开启/关闭 —— 临时开关自动发货（管理员）',
+      '  微店发货 —— 手动执行一次发货，即使定时发货关闭也可用（管理员）',
+      '  微店发货开启/关闭 —— 运行时开关定时发货，状态会保存（管理员）',
       '  微店发货状态 —— 查看发货进度与卡密用量（管理员）',
       '  微店发货重置 —— 清空发货与卡密记录（管理员）',
       '监控模板变量：{project} {name} {amount} {diff} {change} {supporters} {link}',
