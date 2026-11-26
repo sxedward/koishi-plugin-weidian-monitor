@@ -18,8 +18,14 @@ const PLATFORM_LINK = {
 }
 
 const DEFAULT_TEMPLATE = '【{project}】新集资 +{diff} 元，当前 {amount} 元，{supporters} 人参与\n{link}'
+const DEFAULT_DELIVERY_TEMPLATE = '【自动发货】订单 {orderId} 已发货（{mode}）\n商品：{items}\n金额：{amount} 元\n卡密：{codes}'
 
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36'
+
+// 微店商家后台接口（从 d.weidian.com 前端资源提取）
+const WD_ORDER_LIST_API = 'https://thor.weidian.com/tradeview/seller.getOrderListForPC/1.0'
+const WD_ORDER_DELIVER_API = 'https://thor.weidian.com/tradeview/seller.deliverOrder/1.0'
+const WD_SUB_ACCOUNT_LOGIN_URL = 'https://d.weidian.com/weidian-pc/login/#/subAccount'
 
 /* ---------------------------------- 工具 ---------------------------------- */
 
@@ -205,6 +211,74 @@ async function request(ctx, url, headers, timeout) {
   }
 }
 
+// 微店后台接口的 status 字段在不同接口里可能是 code / status_code / statusCode
+function apiCode(payload) {
+  const status = payload?.status || payload?.result?.status || {}
+  const value = status.code ?? status.status_code ?? status.statusCode ?? status.status
+  return Number(value)
+}
+
+function apiMessage(payload) {
+  const status = payload?.status || payload?.result?.status || {}
+  return String(status.message || status.description || status.status_reason || status.reason || '未知错误')
+}
+
+function orderAmount(order) {
+  const candidates = [
+    order?.total, order?.payFee, order?.paidAmount, order?.amount,
+    order?.normalPriceInfo?.totalPrice, order?.priceInfo?.totalPrice,
+  ]
+  for (const value of candidates) {
+    const parsed = Number(String(value ?? '').replace(/[^\d.-]/g, ''))
+    if (Number.isFinite(parsed) && parsed > 0) return parsed
+  }
+  return 0
+}
+
+function orderItems(order) {
+  const items = order?.itemList || order?.items || []
+  return Array.isArray(items) ? items : []
+}
+
+function isPaidOrder(order) {
+  const status = order?.status
+  const paid = status === 20 || status === '20' || status === 'paid' || status === 'PAID'
+    || /待发货/.test(String(order?.statusText || order?.statusName || ''))
+  if (!paid) return false
+  const refund = order?.refund_status ?? order?.refundStatus ?? order?.refundStatusList
+  if (refund === 1 || refund === 2 || refund === '1' || refund === '2') return false
+  if (order?.flagInfo && order.flagInfo.canBatchOperate === false) return false
+  if (Number(order?.cityExpressStatus) === 20) return false
+  // 拼团未成团时发货会钱货两空，稳妥起见跳过
+  if (Number(order?.group_status) > 0 && Number(order?.group_status) !== 1) return false
+  return true
+}
+
+function matchesDeliveryFilter(order, delivery) {
+  const items = orderItems(order)
+  const ids = delivery.itemIds || []
+  const skus = delivery.skuIds || []
+  const titles = delivery.itemTitles || []
+  if (!ids.length && !skus.length && !titles.length) return true
+  return items.some((item) => {
+    const itemId = String(item?.itemId ?? item?.item_id ?? item?.curShopItemId ?? '')
+    const skuId = String(item?.skuId ?? item?.itemSkuId ?? item?.sku_id ?? item?.curShopSkuId ?? '')
+    const title = String(item?.title ?? item?.itemTitle ?? item?.name ?? '')
+    if (ids.length && !ids.includes(itemId)) return false
+    if (skus.length && !skus.includes(skuId)) return false
+    if (titles.length && !titles.some((word) => title.includes(word))) return false
+    return true
+  })
+}
+
+function orderItemText(order) {
+  return orderItems(order).map((item) => {
+    const title = item?.title || item?.itemTitle || item?.name || '商品'
+    const quantity = Number(item?.quantity ?? item?.num ?? 1)
+    return quantity > 1 ? `${title} ×${quantity}` : title
+  }).join('、') || '订单商品'
+}
+
 async function fetchSnapshot(ctx, project, timeout, loginCookie) {
   const url = buildUrl(project)
   const headers = { 'User-Agent': UA, Accept: '*/*' }
@@ -248,10 +322,35 @@ const Config = Schema.object({
   smsCodeSelector: Schema.string().default('input[placeholder="短信验证码"], .message-code-input input, input[name="verify-code"]')
     .description('短信验证码输入框选择器'),
   autoSlideCaptcha: Schema.boolean().default(true).description('遇到安全验证时尝试自动滑动；失败会提示改用扫码登录或手动 Cookie'),
+  subAccountLoginUrl: Schema.string().default(WD_SUB_ACCOUNT_LOGIN_URL).description('微店子账号登录页地址'),
+  subAccountSelector: Schema.string().default('input[placeholder="子账号登录名"], input[name="subaccountId"]')
+    .description('子账号登录名输入框选择器'),
+  autoDelivery: Schema.object({
+    enabled: Schema.boolean().default(false).description('是否启用订单自动发货'),
+    interval: Schema.number().min(10).default(30).description('轮询待发货订单的间隔（秒）'),
+    cookie: Schema.string().role('secret').default('').description('发货专用 Cookie；留空则用「微店Cookie」保存的 Cookie（建议用权限全开的子账号登录）'),
+    listType: Schema.number().min(0).max(3).default(0).description('订单列表类型，0=普通订单'),
+    mode: Schema.union([
+      Schema.const('no-logistics'), Schema.const('ecode'), Schema.const('express'),
+    ]).default('no-logistics').description('发货方式：无需物流 / 电子卡券码 / 快递'),
+    expressType: Schema.string().default('0').description('快递公司编号，无需物流填 0'),
+    expressNo: Schema.string().default('').description('快递单号'),
+    expressCustom: Schema.string().default('').description('自定义快递公司名称'),
+    eCodes: Schema.array(Schema.string()).default([]).description('卡密池，ecode 模式按顺序消费，已使用的会记录到状态文件'),
+    itemIds: Schema.array(Schema.string()).default([]).description('仅发货这些商品 ID，留空表示全部商品'),
+    skuIds: Schema.array(Schema.string()).default([]).description('仅发货这些 SKU ID，留空表示不限'),
+    itemTitles: Schema.array(Schema.string()).default([]).description('商品标题包含任一关键词才发货，留空表示不限'),
+    minAmount: Schema.number().min(0).default(0).description('订单金额下限，0 表示不限'),
+    channels: Schema.array(Schema.string()).default([]).description('发货结果播报频道'),
+    template: Schema.string().default(DEFAULT_DELIVERY_TEMPLATE).description('发货播报模板'),
+    dryRun: Schema.boolean().default(false).description('演练模式：只记录不真正发货'),
+    maxPerRun: Schema.number().min(1).max(100).default(20).description('每轮最多处理的订单数'),
+    retryAttempts: Schema.number().min(0).max(5).default(2).description('单笔发货失败重试次数'),
+  }).default({}).description('订单自动发货配置'),
 })
 
 exports.name = 'weidian-monitor'
-exports.usage = '微店 / 摩点 / OWHAT / 桃叭 众筹监控播报。管理员可通过「微店登录」扫码、「微店密码登录」或「微店短信登录」自动提取 Cookie，也可用「微店Cookie」手动设置。'
+exports.usage = '微店 / 摩点 / OWHAT / 桃叭 众筹监控播报；支持用子账号 Cookie 自动拉取微店待发货订单并发货。管理员可通过多种方式登录并自动提取 Cookie。'
 exports.Config = Config
 // 浏览器服务为可选依赖：未安装 puppeteer 插件时监控照常工作，仅扫码登录不可用。
 exports.inject = { optional: ['puppeteer'] }
@@ -259,13 +358,17 @@ exports.inject = { optional: ['puppeteer'] }
 exports.apply = (ctx, config) => {
   const logger = ctx.logger('weidian-monitor')
   const statePath = path.join(ctx.baseDir || process.cwd(), 'weidian-monitor-state.json')
-  const defaultState = { snapshots: {}, enabled: {}, globalThanks: '', login: null }
-  const state = { ...defaultState }
+  const defaultState = {
+    snapshots: {}, enabled: {}, globalThanks: '', login: null,
+    delivery: { enabled: null, processed: {}, usedCodes: [], lastRun: 0, lastSummary: '' },
+  }
+  const state = { ...defaultState, delivery: { ...defaultState.delivery } }
   const timers = []
   // 短信登录需要跨命令保留浏览器页面：userId -> { page, phone, expiresAt, timer, session }
   const pendingLogins = new Map()
   let started = false
   let loginInProgress = false
+  let deliveryInProgress = false
 
   const isAdmin = (session) => config.admins.includes(session.userId)
   const isEnabled = (index) => state.enabled[index] ?? config.projects[index].enabled
@@ -279,6 +382,12 @@ exports.apply = (ctx, config) => {
         state.enabled = raw.enabled || {}
         state.globalThanks = raw.globalThanks || ''
         state.login = raw.login || null
+        state.delivery = {
+          ...defaultState.delivery,
+          ...(raw.delivery || {}),
+          processed: raw.delivery?.processed || {},
+          usedCodes: raw.delivery?.usedCodes || [],
+        }
       }
     } catch {
       // 首次运行或状态文件损坏时，从空状态开始
@@ -312,6 +421,208 @@ exports.apply = (ctx, config) => {
       }
     }
     return sent
+  }
+
+  /* ---------------------------- 订单自动发货 ---------------------------- */
+
+  const deliveryConfig = () => config.autoDelivery || {}
+
+  function deliveryEnabled() {
+    return state.delivery.enabled ?? deliveryConfig().enabled ?? false
+  }
+
+  function deliveryCookie() {
+    return deliveryConfig().cookie || state.login?.cookie || ''
+  }
+
+  async function wdApi(endpoint, param, cookie) {
+    if (!cookie) throw new Error('没有可用的微店 Cookie，请先用子账号登录或「微店Cookie」设置')
+    const url = `${endpoint}?param=${encodeURIComponent(JSON.stringify(param))}`
+    const headers = {
+      'User-Agent': UA,
+      Accept: 'application/json, text/plain, */*',
+      Referer: 'https://d.weidian.com/',
+      Origin: 'https://d.weidian.com',
+      Cookie: cookie,
+    }
+    const response = await request(ctx, url, headers, config.requestTimeout)
+    const payload = parseLooseJson(response)
+    if (apiCode(payload) !== 0) throw new Error(apiMessage(payload))
+    return payload
+  }
+
+  async function fetchPaidOrders(cookie) {
+    const delivery = deliveryConfig()
+    const payload = await wdApi(WD_ORDER_LIST_API, {
+      listType: delivery.listType ?? 0,
+      pageNum: 0,
+      pageSize: Math.min(50, Math.max(20, Number(delivery.maxPerRun) || 20)),
+      statusList: ['paid'],
+      refundStatusList: [],
+      channel: 'pc',
+      specialOrderSearchCondition: {
+        notShowGroupUnsuccess: 1,
+        notShowFxOrder: 0,
+      },
+    }, cookie)
+    const orders = payload?.result?.orderList || payload?.result?.orders || []
+    return Array.isArray(orders) ? orders : []
+  }
+
+  function pickCodes(count) {
+    const delivery = deliveryConfig()
+    const pool = (delivery.eCodes || []).map((item) => String(item).trim()).filter(Boolean)
+    const used = new Set(state.delivery.usedCodes || [])
+    const picked = []
+    for (const code of pool) {
+      if (picked.length >= count) break
+      if (used.has(code)) continue
+      picked.push(code)
+    }
+    return picked
+  }
+
+  function deliveryModeLabel(mode) {
+    return { 'no-logistics': '无需物流', ecode: '电子卡券', express: '快递' }[mode] || mode
+  }
+
+  function renderDelivery(template, order, codes, mode) {
+    const variables = {
+      orderId: String(order?.orderId ?? order?.order_id ?? ''),
+      items: orderItemText(order),
+      amount: money(orderAmount(order)),
+      codes: codes.length ? codes.join('; ') : '无',
+      mode: deliveryModeLabel(mode),
+      buyer: String(order?.buyerInfo?.name || order?.buyerName || '买家'),
+      time: new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' }),
+    }
+    return Object.entries(variables).reduce(
+      (text, [key, value]) => text.split(`{${key}}`).join(value),
+      template,
+    )
+  }
+
+  async function deliverOne(order, cookie) {
+    const delivery = deliveryConfig()
+    const mode = delivery.mode || 'no-logistics'
+    const orderId = String(order?.orderId ?? order?.order_id ?? '')
+    if (!orderId) throw new Error('订单缺少 orderId，无法发货')
+
+    const param = {
+      from: 'pc',
+      orderId,
+      expressNo: '',
+      expressType: '0',
+      expressCustom: '',
+      fullDeliver: true,
+    }
+    let codes = []
+    if (mode === 'express') {
+      param.expressType = String(delivery.expressType ?? '0')
+      param.expressNo = String(delivery.expressNo || '')
+      param.expressCustom = String(delivery.expressCustom || '')
+      if (Number(param.expressType) !== 0 && !param.expressNo) throw new Error('快递模式必须配置 expressNo')
+    } else if (mode === 'ecode') {
+      const quantity = orderItems(order).reduce((sum, item) => sum + Math.max(1, Number(item?.quantity ?? item?.num ?? 1)), 0)
+      codes = pickCodes(Math.max(1, quantity))
+      if (!codes.length) throw new Error('卡密池已用尽，请配置 autoDelivery.eCodes 或重置发货状态')
+      param.eCodeList = codes.map((code) => ({ eCode: code }))
+      param.expressType = '0'
+    }
+
+    if (delivery.dryRun) {
+      return { ok: true, dryRun: true, codes, message: '演练模式，未实际发货' }
+    }
+
+    let lastError
+    const attempts = Math.max(1, Number(delivery.retryAttempts ?? 2) + 1)
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        await wdApi(WD_ORDER_DELIVER_API, param, cookie)
+        return { ok: true, codes, message: '发货成功' }
+      } catch (error) {
+        lastError = error
+        if (attempt < attempts) await sleep(1000 * attempt)
+      }
+    }
+    return { ok: false, codes, message: lastError?.message || '发货失败' }
+  }
+
+  async function runAutoDelivery() {
+    if (deliveryInProgress) return { summary: '已有自动发货任务正在执行，请稍后再试。', lines: [] }
+    const delivery = deliveryConfig()
+    if (!deliveryEnabled()) return { summary: '自动发货未启用。可发送「微店发货开启」临时开启。', lines: [] }
+    const cookie = deliveryCookie()
+    if (!cookie) return { summary: '没有可用的微店 Cookie，请先登录或设置 Cookie。', lines: [] }
+
+    deliveryInProgress = true
+    const lines = []
+    let total = 0
+    let success = 0
+    let failed = 0
+    let skipped = 0
+    try {
+      const orders = await fetchPaidOrders(cookie)
+      total = orders.length
+      const limit = Math.min(orders.length, Math.max(1, Number(delivery.maxPerRun) || 20))
+      for (const order of orders.slice(0, limit)) {
+        const orderId = String(order?.orderId ?? order?.order_id ?? '')
+        if (!isPaidOrder(order)) {
+          skipped += 1
+          continue
+        }
+        if (state.delivery.processed[orderId]) {
+          skipped += 1
+          continue
+        }
+        if (!matchesDeliveryFilter(order, delivery)) {
+          skipped += 1
+          continue
+        }
+        if (Number(delivery.minAmount || 0) > 0 && orderAmount(order) < Number(delivery.minAmount)) {
+          skipped += 1
+          continue
+        }
+        try {
+          const result = await deliverOne(order, cookie)
+          state.delivery.processed[orderId] = {
+            at: Date.now(), ok: result.ok, dryRun: !!result.dryRun,
+            mode: delivery.mode || 'no-logistics', codes: result.codes, message: result.message,
+          }
+          if (result.ok && !result.dryRun) {
+            for (const code of result.codes) {
+              if (!state.delivery.usedCodes.includes(code)) state.delivery.usedCodes.push(code)
+            }
+            success += 1
+            if (delivery.channels?.length) {
+              await broadcast(delivery.channels, renderDelivery(
+                delivery.template || DEFAULT_DELIVERY_TEMPLATE, order, result.codes, delivery.mode || 'no-logistics',
+              ))
+            }
+            lines.push(`✅ ${orderId} ${result.message}`)
+          } else if (result.ok && result.dryRun) {
+            skipped += 1
+            lines.push(`🔎 ${orderId} 演练：${result.message}`)
+          } else {
+            failed += 1
+            lines.push(`❌ ${orderId} ${result.message}`)
+          }
+        } catch (error) {
+          failed += 1
+          lines.push(`❌ ${orderId} ${error.message}`)
+        }
+        await saveState()
+      }
+      state.delivery.lastRun = Date.now()
+      state.delivery.lastSummary = `待发货 ${total}，成功 ${success}，失败 ${failed}，跳过 ${skipped}`
+      await saveState()
+      return { summary: state.delivery.lastSummary, lines, total, success, failed, skipped }
+    } catch (error) {
+      logger.warn(`自动发货失败：${error.message}`)
+      return { summary: `自动发货失败：${error.message}`, lines, total, success, failed, skipped }
+    } finally {
+      deliveryInProgress = false
+    }
   }
 
   function render(template, project, snapshot, previous) {
@@ -766,6 +1077,47 @@ exports.apply = (ctx, config) => {
     }
   }
 
+  async function loginWithSubAccount(session, phone, account, password) {
+    const missing = requirePuppeteer()
+    if (missing) return missing
+    if (loginInProgress) return '已有登录流程正在进行，请等待完成或超时后再试。'
+    const normalizedPhone = String(phone || '').trim()
+    if (!/^\d{11}$/.test(normalizedPhone)) return '请输入 11 位绑定手机号，例如：微店子账号登录 13800138000 发货员 密码'
+    loginInProgress = true
+    let page
+    try {
+      page = await ctx.puppeteer.page()
+      await page.goto(config.subAccountLoginUrl || WD_SUB_ACCOUNT_LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: config.requestTimeout * 1000 })
+      await sleep(500)
+      await typeInto(page, config.phoneSelector, normalizedPhone)
+      await typeInto(page, config.subAccountSelector, account)
+      await typeInto(page, config.passwordSelector, password)
+      await ensureAgreement(page)
+      if (await detectCaptcha(page) && config.autoSlideCaptcha) await solveCaptcha(page)
+      if (!await submitLoginButton(page)) throw new Error('找不到登录按钮，请检查页面结构或选择器配置')
+      const result = await waitForLogin(page, config.loginTimeout)
+      if (!result.ok) {
+        if (result.captcha) {
+          await sendScreenshot(page, session, '子账号登录触发了安全验证，自动滑动未通过。请改用扫码登录或手动 Cookie。')
+        }
+        return `子账号登录失败：${result.error}`
+      }
+      return await saveLogin(page, 'subaccount', '子账号')
+    } catch (error) {
+      logger.warn(`微店子账号登录失败：${error.message}`)
+      return `子账号登录失败：${error.message}`
+    } finally {
+      if (page) {
+        try {
+          await page.close()
+        } catch {
+          // 页面已关闭
+        }
+      }
+      loginInProgress = false
+    }
+  }
+
   async function requestSmsCode(session, phone) {
     const missing = requirePuppeteer()
     if (missing) return missing
@@ -885,6 +1237,12 @@ exports.apply = (ctx, config) => {
     config.projects.forEach((project, index) => {
       timers.push(ctx.setInterval(() => poll(index), Math.max(10, project.interval) * 1000))
     })
+    if (deliveryEnabled()) {
+      timers.push(ctx.setInterval(() => {
+        if (!deliveryInProgress) runAutoDelivery().catch((error) => logger.warn(`自动发货异常：${error.message}`))
+      }, Math.max(10, Number(deliveryConfig().interval) || 30) * 1000))
+      logger.info('微店订单自动发货已启动')
+    }
     logger.info(`微店监控已启动，共 ${config.projects.length} 个项目`)
   })
 
@@ -980,7 +1338,7 @@ exports.apply = (ctx, config) => {
       if (!isAdmin(session)) return '您没有权限执行此命令。'
       if (cookie === undefined || !cookie.trim()) {
         if (!state.login) return '当前没有保存的 Cookie。可发送「微店登录」「微店密码登录」「微店短信登录」，或用「微店Cookie <内容>」手动设置。'
-        const sourceLabel = { qr: '扫码登录', password: '密码登录', sms: '短信登录', manual: '手动设置' }
+        const sourceLabel = { qr: '扫码登录', password: '密码登录', sms: '短信登录', subaccount: '子账号登录', manual: '手动设置' }
         return `已保存 Cookie：${maskCookie(state.login.cookie)}\n`
           + `来源：${sourceLabel[state.login.source] || '手动设置'}\n`
           + `保存时间：${new Date(state.login.savedAt).toLocaleString('zh-CN')}`
@@ -996,6 +1354,64 @@ exports.apply = (ctx, config) => {
       return `Cookie 已保存：${maskCookie(value)}`
     })
 
+  ctx.command('微店子账号登录 <phone:string> <account:string> <password:string>', '用微店子账号登录并自动提取 Cookie（管理员，强烈建议私聊）')
+    .action(async ({ session }, phone, account, password) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      return loginWithSubAccount(session, phone, account, password)
+    })
+
+  ctx.command('微店发货', '立即执行一次订单自动发货（管理员）')
+    .action(async ({ session }) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      const result = await runAutoDelivery()
+      return [result.summary, ...result.lines].join('\n')
+    })
+
+  ctx.command('微店发货开启', '临时开启自动发货（管理员）')
+    .action(async ({ session }) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      state.delivery.enabled = true
+      await saveState()
+      return '自动发货已开启。'
+    })
+
+  ctx.command('微店发货关闭', '临时关闭自动发货（管理员）')
+    .action(async ({ session }) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      state.delivery.enabled = false
+      await saveState()
+      return '自动发货已关闭。'
+    })
+
+  ctx.command('微店发货状态', '查看自动发货状态（管理员）')
+    .action(async ({ session }) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      const processed = Object.keys(state.delivery.processed || {}).length
+      const lastCodes = (state.delivery.usedCodes || []).length
+      const lastRun = state.delivery.lastRun
+        ? new Date(state.delivery.lastRun).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })
+        : '尚未运行'
+      return [
+        `自动发货：${deliveryEnabled() ? '已启用' : '已关闭'}（${state.delivery.enabled === null ? '跟随配置' : '命令覆盖'}）`,
+        `发货方式：${deliveryModeLabel(deliveryConfig().mode || 'no-logistics')}`,
+        `Cookie：${maskCookie(deliveryCookie())}`,
+        `已处理订单：${processed}｜已用卡密：${lastCodes}`,
+        `最近运行：${lastRun}`,
+        `最近结果：${state.delivery.lastSummary || '无'}`,
+      ].join('\n')
+    })
+
+  ctx.command('微店发货重置', '清空发货去重记录与卡密使用记录（管理员）')
+    .action(async ({ session }) => {
+      if (!isAdmin(session)) return '您没有权限执行此命令。'
+      state.delivery.processed = {}
+      state.delivery.usedCodes = []
+      state.delivery.lastRun = 0
+      state.delivery.lastSummary = ''
+      await saveState()
+      return '已清空发货记录与卡密使用记录。'
+    })
+
   ctx.command('微店帮助', '查看微店监控插件的命令')
     .action(() => [
       '微店监控插件命令：',
@@ -1009,7 +1425,13 @@ exports.apply = (ctx, config) => {
       '  微店短信登录 <手机号> —— 发送短信验证码（管理员，建议私聊）',
       '  微店验证码 <验证码> —— 完成短信登录（管理员）',
       '  微店登录取消 —— 取消待验证的短信登录（管理员）',
+      '  微店子账号登录 <手机号> <子账号> <密码> —— 用权限子账号登录（管理员，建议私聊）',
       '  微店Cookie [内容] —— 查看/设置/清除 Cookie（管理员）',
-      '模板变量：{project} {name} {amount} {diff} {change} {supporters} {link}',
+      '  微店发货 —— 立即执行一次自动发货（管理员）',
+      '  微店发货开启/关闭 —— 临时开关自动发货（管理员）',
+      '  微店发货状态 —— 查看发货进度与卡密用量（管理员）',
+      '  微店发货重置 —— 清空发货与卡密记录（管理员）',
+      '监控模板变量：{project} {name} {amount} {diff} {change} {supporters} {link}',
+      '发货模板变量：{orderId} {items} {amount} {codes} {mode} {buyer} {time}',
     ].join('\n'))
 }
